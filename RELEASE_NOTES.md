@@ -1,94 +1,80 @@
-## gdstyle 0.3.2
+## gdstyle 0.3.3
 
-A small release with one new formatter option and one formatter fix. `fmt` can
-now keep a blank line between public and private variables, and it no longer
-pushes `@warning_ignore(...)` away from the declaration it covers.
-
-### Added
-
-- **`blank_line_between_public_and_private` config setting** (default:
-  `false`). `fmt` puts same-kind declarations in one tight block, so public and
-  `_`-prefixed variables ran together and a blank line added by hand was
-  removed on the next format. With the setting on, `fmt` keeps one blank line
-  wherever a public declaration meets a private one:
-
-  ```toml
-  blank_line_between_public_and_private = true
-  ```
-
-  ```gdscript
-  var is_idle: bool = false
-  var idle_timer: float = 0.0
-
-  var _velocity: Vector2 = Vector2.ZERO
-  ```
-
-  It applies to constants, static variables, `@export` variables, plain
-  variables and `@onready` variables. Signals, enums and functions are not
-  affected.
-
-  Two limits to know about:
-
-  - Members are not reordered. The line is added at every public/private
-    boundary, so interleaved declarations (`a`, `_b`, `c`) get a separator at
-    each one.
-  - It applies to script-level members. Inner-class bodies keep the blank
-    lines they were written with.
-
-  Godot's style guide has no written rule for this, which is why it is off by
-  default. Output is unchanged unless you turn it on.
-  ([#38](https://github.com/atelico/gdstyle/issues/38),
-  [#39](https://github.com/atelico/gdstyle/pull/39))
+A formatter fix release for files that use `@warning_ignore_start` and
+`@warning_ignore_restore`. `fmt` no longer changes which code a region covers,
+and it keeps the two markers tight against the region.
 
 ### Fixed
 
-- **`fmt` no longer separates `@warning_ignore(...)` from its declaration.**
-  An annotation on its own line was treated as the end of the previous member,
-  so the blank lines between members were inserted below it. A doc comment
-  above it was also split off from the declaration:
+- **`fmt` no longer moves members into or out of a `@warning_ignore_start`
+  region.** The two markers are standalone lines, and the reorder moved each
+  one with whichever member followed it, so the pair did not move together:
+
+  ```gdscript
+  var health = 10
+  @warning_ignore_start("unused_signal")
+  signal a
+  signal b
+  @warning_ignore_restore("unused_signal")
+  var z = 1
+  ```
+
+  0.3.2 sorted the signals above `health` and left the restore marker with
+  `z`, so `health` ended up inside the region with its warnings silenced:
+
+  ```gdscript
+  @warning_ignore_start("unused_signal")
+
+  signal a
+  signal b
+
+  var health = 10
+
+
+  @warning_ignore_restore("unused_signal")
+  var z = 1
+  ```
+
+  `fmt` now skips the reorder whenever it would change which lines a region
+  covers, in the script and in inner classes. It still reorders when only
+  members outside the region move. On a skipped file `check` keeps reporting
+  `order/class-member-order`, so the order can be fixed by hand. The README
+  has a new section, "When the formatter leaves the order alone", that lists
+  the cases. ([#41](https://github.com/atelico/gdstyle/pull/41))
+
+- **Region markers stay tight against the code they bracket.** The gap between
+  members could land between `@warning_ignore_start(...)` and the first member
+  it covers. The start marker now counts as the head of the first covered
+  member (above its doc and comment block, if it has one), the restore marker
+  as the tail of the last one, and blank lines between a marker and its region
+  are removed. The example above now formats to:
 
   ```gdscript
   var health = 10
 
-  ## Cached speed.
-  @warning_ignore("unused_private_class_variable")
+  @warning_ignore_start("unused_signal")
+  signal a
+  signal b
+  @warning_ignore_restore("unused_signal")
 
-  var _speed = 300.0
-  @warning_ignore("unused_parameter")
-
-
-  func foo(a):
-  	pass
+  var z = 1
   ```
 
-  The annotation now stays tight against the declaration below it, and the
-  blank lines go above it:
+  Around functions, the two blank lines go above the start marker and below
+  the restore marker. This applies to script-level markers; inner-class bodies
+  keep their blank lines as written. **Files with region markers may be
+  reformatted once.** ([#41](https://github.com/atelico/gdstyle/pull/41))
 
-  ```gdscript
-  var health = 10
-  ## Cached speed.
-  @warning_ignore("unused_private_class_variable")
-  var _speed = 300.0
+### Changelog
 
-
-  @warning_ignore("unused_parameter")
-  func foo(a):
-  	pass
-  ```
-
-  This covers variables, constants, signals, enums, functions and inner
-  classes, including several stacked `@warning_ignore` lines. The old output
-  still loaded in Godot, so nothing was broken at runtime. **Files with a
-  standalone `@warning_ignore` line will be reformatted once.**
-  ([#40](https://github.com/atelico/gdstyle/pull/40))
-
-### Known issues
-
-- When `fmt` reorders members that sit between `@warning_ignore_start` and
-  `@warning_ignore_restore`, the two markers do not move as a pair, so the
-  region can end up covering different members. This is not new in 0.3.2.
+- Fixed: `fmt` no longer changes which members a `@warning_ignore_start` /
+  `@warning_ignore_restore` region covers when it reorders (#41).
+- Fixed: `fmt` keeps region markers tight against the region, with blank lines
+  outside it (#41).
+- Docs: new README section on when `fmt` skips reordering, and a
+  `CHANGELOG.md` with a short entry for every release.
 
 ### Upgrading
 
-No configuration changes are required. The new setting is opt-in. The only
-change to existing output is the `@warning_ignore` fix above.
+No configuration changes are required. This resolves the known issue listed
+in the 0.3.2 notes.

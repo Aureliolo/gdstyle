@@ -4,7 +4,7 @@ use crate::fixer;
 use crate::lexer::Lexer;
 use crate::linter;
 use crate::parser::Parser;
-use crate::token::TokenKind;
+use crate::token::{Token, TokenKind};
 
 /// Format a GDScript source string according to style rules.
 ///
@@ -51,7 +51,7 @@ fn format_pass(source: &str, config: &Config) -> String {
     //    output is re-parsed to verify it has the same set of class members
     //    as the input: if anything mutated, we keep the original.
     result = safe_reorder_class_members(&result);
-    result = reorder_inner_classes(&result);
+    result = safe_reorder_inner_classes(&result);
 
     // 2. Normalize indentation.
     result = normalize_indentation(&result, config);
@@ -199,39 +199,102 @@ fn leading_annotation_line(member: &ClassMember) -> Option<usize> {
 }
 
 /// First line (1-indexed) of the run of standalone `@warning_ignore(...)`
-/// lines sitting directly above `decl_start`, or `decl_start` itself when
-/// there is none.
+/// and `@warning_ignore_start(...)` lines sitting directly above `below`, or
+/// `below` itself when there is none.
 ///
-/// The parser deliberately drops `@warning_ignore` instead of attaching it
-/// to a member (it may precede any statement, including ones whose AST node
-/// has no annotation slot), so `leading_annotation_line` never sees it.
-/// Without this the annotation would count as the tail of the previous
+/// The parser deliberately drops these annotations instead of attaching them
+/// to a member (they may precede any statement, including ones whose AST
+/// node has no annotation slot), so `leading_annotation_line` never sees
+/// them. Without this the annotation would count as the tail of the previous
 /// member and the canonical gap would land between it and the declaration
-/// it applies to.
+/// it applies to (or, for a region, the first declaration it covers).
 ///
 /// `declaration_lines` holds the keyword line of every member: a line such
 /// as `@warning_ignore("x") var y = 1` is a declaration of its own and must
-/// not be absorbed. The region markers `@warning_ignore_start` /
-/// `@warning_ignore_restore` are not tied to one declaration, so they are
-/// left where they are.
+/// not be absorbed. `@warning_ignore_restore` is not matched: it closes a
+/// region, so it stays the tail of the member above it.
 fn leading_warning_ignore_start(
     lines: &[&str],
     declaration_lines: &std::collections::HashSet<usize>,
-    decl_start: usize,
+    below: usize,
 ) -> usize {
-    let mut first_line = decl_start;
+    let mut first_line = below;
     while first_line > 1 {
         let candidate = first_line - 1;
-        let is_standalone_warning_ignore = lines
-            .get(candidate - 1)
-            .is_some_and(|line| line.trim_start().starts_with("@warning_ignore("))
-            && !declaration_lines.contains(&candidate);
+        let is_standalone_warning_ignore = lines.get(candidate - 1).is_some_and(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("@warning_ignore(") || trimmed.starts_with("@warning_ignore_start(")
+        }) && !declaration_lines.contains(&candidate);
         if !is_standalone_warning_ignore {
             break;
         }
         first_line = candidate;
     }
     first_line
+}
+
+/// Remove the blank lines that separate a script-level region marker from
+/// the code it brackets: those directly below `@warning_ignore_start(...)`
+/// and those directly above `@warning_ignore_restore(...)`.
+///
+/// With the markers tight against the region, `normalize_member_spacing`
+/// can treat the start marker as the head of the first covered member and
+/// the restore marker as the tail of the last one, so the canonical gaps
+/// fall outside the region instead of between a marker and its code.
+///
+/// Marker lines are taken from the lexer's annotation tokens rather than
+/// matched as text, so a look-alike line inside a multi-line string is
+/// never touched. Only column-1 markers count; indented ones belong to an
+/// inner class or a function body, which this pass leaves alone.
+fn tighten_warning_ignore_region_markers(source: &str, tokens: &[Token]) -> String {
+    let marker_lines = |marker_name: &str| -> std::collections::HashSet<usize> {
+        tokens
+            .iter()
+            .filter(|token| {
+                token.span.column == 1
+                    && matches!(&token.kind, TokenKind::Annotation(name) if name == marker_name)
+            })
+            .map(|token| token.span.line)
+            .collect()
+    };
+    let start_lines = marker_lines("warning_ignore_start");
+    let restore_lines = marker_lines("warning_ignore_restore");
+    if start_lines.is_empty() && restore_lines.is_empty() {
+        return source.to_string();
+    }
+
+    let lines: Vec<&str> = source.split('\n').collect();
+    let is_blank = |line_number: usize| {
+        lines
+            .get(line_number - 1)
+            .is_some_and(|line| line.trim().is_empty())
+    };
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    // Line number (1-indexed) of the last non-blank line seen so far.
+    let mut last_code_line: Option<usize> = None;
+    let mut pending_blank_count = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let line_number = index + 1;
+        if is_blank(line_number) {
+            pending_blank_count += 1;
+            continue;
+        }
+        let follows_start_marker =
+            last_code_line.is_some_and(|previous| start_lines.contains(&previous));
+        // A restore marker with nothing above it has no region to close up
+        // against, so its leading blank lines stay.
+        let closes_region = restore_lines.contains(&line_number) && last_code_line.is_some();
+        if !follows_start_marker && !closes_region {
+            kept.extend(std::iter::repeat_n("", pending_blank_count));
+        }
+        pending_blank_count = 0;
+        kept.push(line);
+        last_code_line = Some(line_number);
+    }
+    // Trailing blank lines (including the empty piece after the final
+    // newline) are not this pass's business.
+    kept.extend(std::iter::repeat_n("", pending_blank_count));
+    kept.join("\n")
 }
 
 /// Top-level item in the source, used by `normalize_member_spacing`. A unit
@@ -262,6 +325,8 @@ struct MemberUnit {
 /// constants and variables that would otherwise sit tight get one blank line
 /// wherever a public declaration meets a private (`_`-prefixed) one.
 fn normalize_member_spacing(source: &str, config: &Config) -> String {
+    let tightened = tighten_warning_ignore_region_markers(source, &Lexer::new(source).tokenize());
+    let source = tightened.as_str();
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
     let members = Parser::new(&tokens).parse();
@@ -400,6 +465,9 @@ fn normalize_member_spacing(source: &str, config: &Config) -> String {
                         start = c_start;
                     }
                 }
+                // A region may open above the member's doc or comment block
+                // rather than directly above the declaration.
+                let start = leading_warning_ignore_start(&lines, &declaration_lines, start);
 
                 pending_doc_start = None;
                 pending_doc_last = None;
@@ -1239,7 +1307,89 @@ fn safe_reorder_class_members(source: &str) -> String {
     if !same_member_signatures(&original_members, &reordered_members) {
         return source.to_string();
     }
+
+    // Guard 3: keep `@warning_ignore_start` / `@warning_ignore_restore`
+    // regions covering the same code.
+    if changes_warning_ignore_regions(source, &reordered) {
+        return source.to_string();
+    }
     reordered
+}
+
+/// Reorder the members of each inner class, unless doing so would change
+/// which code a `@warning_ignore_start` region covers (see
+/// `changes_warning_ignore_regions`).
+fn safe_reorder_inner_classes(source: &str) -> String {
+    let reordered = reorder_inner_classes(source);
+    if changes_warning_ignore_regions(source, &reordered) {
+        return source.to_string();
+    }
+    reordered
+}
+
+/// True if moving lines from `original` to `reordered` changed which code is
+/// covered by a `@warning_ignore_start(...)` region.
+///
+/// The two markers are standalone lines, not part of any member. The reorder
+/// moves a marker with whichever member happens to follow it, so the pair can
+/// end up bracketing different code: a region written around two signals may
+/// afterwards also silence warnings on unrelated variables, or stop covering
+/// the signals. Skipping the reorder is the only safe answer, because there
+/// is no ordering that keeps an arbitrary region intact and still sorts.
+fn changes_warning_ignore_regions(original: &str, reordered: &str) -> bool {
+    if original == reordered || !original.contains("@warning_ignore_start") {
+        return false;
+    }
+    warning_ignore_region_coverage(original) != warning_ignore_region_coverage(reordered)
+}
+
+/// Every code line that sits inside a `@warning_ignore_start` region, paired
+/// with the warning codes ignored at that point, sorted so two sources can be
+/// compared regardless of line order. Reordering only moves lines, so equal
+/// coverage means every line is still ignored for exactly the same warnings.
+///
+/// Regions are textual in Godot: one runs from its `@warning_ignore_start`
+/// line to the matching `@warning_ignore_restore`, or to the end of the file.
+fn warning_ignore_region_coverage(source: &str) -> Vec<(&str, Vec<&str>)> {
+    let mut active_codes: Vec<&str> = Vec::new();
+    let mut coverage: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in source.split('\n') {
+        let trimmed = line.trim();
+        if let Some(arguments) = trimmed.strip_prefix("@warning_ignore_start(") {
+            for code in quoted_strings(arguments) {
+                if !active_codes.contains(&code) {
+                    active_codes.push(code);
+                }
+            }
+        } else if let Some(arguments) = trimmed.strip_prefix("@warning_ignore_restore(") {
+            let restored = quoted_strings(arguments);
+            active_codes.retain(|code| !restored.contains(code));
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') && !active_codes.is_empty() {
+            let mut codes = active_codes.clone();
+            codes.sort_unstable();
+            coverage.push((trimmed, codes));
+        }
+    }
+    coverage.sort_unstable();
+    coverage
+}
+
+/// The contents of each `"..."` or `'...'` literal in `text`, in order.
+/// Used on annotation arguments, which are plain warning names with no
+/// escapes.
+fn quoted_strings(text: &str) -> Vec<&str> {
+    let mut contents = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(['"', '\'']) {
+        let quote = rest[open..].chars().next().unwrap_or('"');
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(quote) else {
+            break;
+        };
+        contents.push(&after_open[..close]);
+        rest = &after_open[close + 1..];
+    }
+    contents
 }
 
 fn parse_members(source: &str) -> Vec<ClassMember> {

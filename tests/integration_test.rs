@@ -3148,6 +3148,151 @@ fn fmt_inline_warning_ignore_declaration_is_not_absorbed_by_next_member() {
     );
 }
 
+// --- @warning_ignore_start regions survive reordering ------------------------
+
+/// Top-level declaration lines of `source`, in order, with the region marker
+/// lines included so tests can assert what each region brackets.
+fn declarations_and_region_markers(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with(['\t', ' ']))
+        .collect()
+}
+
+#[test]
+fn fmt_does_not_reorder_members_into_a_warning_ignore_region() {
+    // Regression: the signals moved above `health` and took the start marker
+    // with them, while the restore marker stayed with `z`. `health` then sat
+    // inside the region and had its warnings silenced.
+    let source = "extends Node\n\nvar health = 10\n@warning_ignore_start(\"unused_signal\")\nsignal a\nsignal b\n@warning_ignore_restore(\"unused_signal\")\nvar z = 1\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        declarations_and_region_markers(&formatted),
+        [
+            "extends Node",
+            "var health = 10",
+            "@warning_ignore_start(\"unused_signal\")",
+            "signal a",
+            "signal b",
+            "@warning_ignore_restore(\"unused_signal\")",
+            "var z = 1",
+        ],
+        "members must keep their order, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        formatter::format_source(&formatted, &default_config()),
+        formatted
+    );
+}
+
+#[test]
+fn fmt_does_not_reorder_members_out_of_an_unclosed_warning_ignore_region() {
+    // A region with no restore runs to the end of the file. Sorting the
+    // signal above the marker would take it out of the region.
+    let source = "extends Node\n\nvar health = 10\n@warning_ignore_start(\"unused_signal\")\nvar z = 1\nsignal a\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        declarations_and_region_markers(&formatted),
+        [
+            "extends Node",
+            "var health = 10",
+            "@warning_ignore_start(\"unused_signal\")",
+            "var z = 1",
+            "signal a",
+        ],
+        "members must keep their order, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn fmt_still_reorders_when_warning_ignore_region_coverage_is_unchanged() {
+    // The region brackets the two signals before and after: only members
+    // outside it move, so the reorder goes ahead.
+    let source = "extends Node\n\n@warning_ignore_start(\"unused_signal\")\nsignal a\nsignal b\n@warning_ignore_restore(\"unused_signal\")\n\n\nfunc f():\n\tpass\n\n\nvar z = 1\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        declarations_and_region_markers(&formatted),
+        [
+            "extends Node",
+            "@warning_ignore_start(\"unused_signal\")",
+            "signal a",
+            "signal b",
+            "@warning_ignore_restore(\"unused_signal\")",
+            "var z = 1",
+            "func f():",
+        ],
+        "`z` must move above `f` without entering the region, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn fmt_does_not_reorder_inner_class_members_across_a_warning_ignore_region() {
+    let source = "extends Node\n\n\nclass Inner:\n\tvar x = 1\n\t@warning_ignore_start(\"unused_signal\")\n\tsignal a\n\t@warning_ignore_restore(\"unused_signal\")\n\tvar y = 2\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(formatted, source);
+}
+
+#[test]
+fn fmt_reorders_normally_when_only_single_line_warning_ignore_is_present() {
+    // `@warning_ignore` (no `_start`) covers one declaration and travels
+    // with it, so it must not block the reorder.
+    let source = "extends Node\n\nvar health = 10\n@warning_ignore(\"unused_signal\")\nsignal a\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        formatted,
+        "extends Node\n\n@warning_ignore(\"unused_signal\")\nsignal a\n\nvar health = 10\n"
+    );
+}
+
+#[test]
+fn fmt_keeps_warning_ignore_region_markers_tight_against_the_region() {
+    // The gap between members goes outside the region: above the start
+    // marker and below the restore marker, never between a marker and the
+    // code it brackets.
+    let source = "extends Node\n\nvar health = 10\n@warning_ignore_start(\"unused_signal\")\n\nsignal a\nsignal b\n\n@warning_ignore_restore(\"unused_signal\")\nvar z = 1\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        formatted,
+        "extends Node\n\nvar health = 10\n\n@warning_ignore_start(\"unused_signal\")\nsignal a\nsignal b\n@warning_ignore_restore(\"unused_signal\")\n\nvar z = 1\n"
+    );
+    assert_eq!(
+        formatter::format_source(&formatted, &default_config()),
+        formatted
+    );
+}
+
+#[test]
+fn fmt_warning_ignore_region_start_attaches_above_doc_and_comment_block() {
+    let source = "extends Node\n@warning_ignore_start(\"x\")\n\n\n# Signals\n## Doc a.\nsignal a\n\n\n@warning_ignore_restore(\"x\")\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        formatted,
+        "extends Node\n\n@warning_ignore_start(\"x\")\n# Signals\n## Doc a.\nsignal a\n@warning_ignore_restore(\"x\")\n"
+    );
+}
+
+#[test]
+fn fmt_warning_ignore_region_markers_around_functions() {
+    // Two blank lines separate the functions and sit outside the region.
+    let source = "extends Node\n\n@warning_ignore_start(\"y\")\n\nfunc f():\n\tpass\n\n@warning_ignore_restore(\"y\")\nfunc h():\n\tpass\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(
+        formatted,
+        "extends Node\n\n\n@warning_ignore_start(\"y\")\nfunc f():\n\tpass\n@warning_ignore_restore(\"y\")\n\n\nfunc h():\n\tpass\n"
+    );
+}
+
+#[test]
+fn fmt_leaves_marker_lookalike_inside_multiline_string_alone() {
+    // The blank line after the look-alike is part of the string's value.
+    let source = "extends Node\n\n\nfunc g():\n\tvar s = \"\"\"\n@warning_ignore_start(\"q\")\n\n\"\"\"\n\treturn s\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(formatted, source);
+}
+
 // --- blank_line_between_public_and_private -----------------------------------
 
 fn public_private_separator_config() -> Config {

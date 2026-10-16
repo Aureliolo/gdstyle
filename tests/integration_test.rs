@@ -6764,3 +6764,32 @@ fn formatting_and_fixing_never_change_a_string_value() {
     }
     assert!(checked > 10, "only {checked} fixtures found");
 }
+
+// Godot's own parser-error test scripts: invalid GDScript with consecutive
+// commas. The comma and colon spacing fixes used to undo each other here, so
+// every `fmt` run changed the file again.
+#[test]
+fn formatter_is_idempotent_on_consecutive_commas() {
+    let config = default_config();
+    for source in [
+        "@export_enum(\"A\",, \"B\", \"C\") var a\n\nfunc test():\n\tpass\n",
+        "func test():\n\tvar array = [\"arrays\",,,,]\n",
+        "func test():\n\tvar dictionary = { hello = \"world\",, }\n",
+        "extends Node\n\nvar test = {\n    AutoTranslateMode.X:\n}\n",
+    ] {
+        let once = formatter::format_source(source, &config);
+        let twice = formatter::format_source(&once, &config);
+        assert_eq!(twice, once, "not idempotent for {source:?}");
+    }
+}
+
+#[test]
+fn enum_fix_keeps_crlf_line_endings() {
+    let source = "extends Node\r\n\r\nenum E {X, Y} # note\r\n";
+    let config = default_config();
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    assert_eq!(
+        fixer::apply_fixes(source, &diagnostics, true),
+        "extends Node\r\n\r\nenum E {\r\n\tX,\r\n\tY,\r\n} # note\r\n"
+    );
+}

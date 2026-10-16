@@ -8,14 +8,58 @@ use crate::token::{QuoteStyle, Span, StringLines, StringPrefix, Token, TokenKind
 /// Tabs are counted at their visual width (4 columns, matching Godot's default)
 /// rather than as a single character, so indented lines are measured as they
 /// appear in the editor.
+///
+/// String data inside a multi-line string doesn't count: `fmt` leaves it alone,
+/// so a warning there could only be cleared by changing the string's value.
+/// The opening line is code and counts in full. The closing line counts when
+/// the code after the closing quote is what pushes it past the limit, even
+/// when another multi-line string opens later on it; when the string data
+/// before the closing quote already exceeds the limit, the line is skipped.
+/// A `\r` takes no columns: inside a string it is data the editor doesn't show.
+///
+/// # Example
+///
+/// ```
+/// use gdstyle::ast::ScriptFile;
+/// use gdstyle::config::Config;
+/// use gdstyle::lexer::Lexer;
+/// use gdstyle::rules::formatting::check_max_line_length;
+///
+/// let long = "x".repeat(120);
+/// let source = format!("var a = \"{long}\"\nvar s = \"\"\"\n{long}\n\"\"\"\n");
+/// let file = ScriptFile {
+///     path: "example.gd".to_string(),
+///     members: vec![],
+///     lines: source.split('\n').map(str::to_string).collect(),
+/// };
+/// let mut diagnostics = Vec::new();
+/// check_max_line_length(&Lexer::new(&source).tokenize(), &file, &Config::default(), &mut diagnostics);
+/// // Only the first line is reported; the long line inside the `"""` literal is data.
+/// assert_eq!(diagnostics.len(), 1);
+/// assert_eq!(diagnostics[0].span.line, 1);
+/// ```
 pub fn check_max_line_length(
+    tokens: &[Token],
     file: &ScriptFile,
     config: &Config,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     const TAB_WIDTH: usize = 4;
+    let string_line_mask = StringLines::new(tokens, file.lines.len());
     for (i, line) in file.lines.iter().enumerate() {
         let line_num = i + 1;
+        if string_line_mask.is_interior(i) {
+            // A line with no closing quote is all string data.
+            let Some(string_data) = string_line_mask
+                .literal_end(i)
+                .and_then(|end| line.get(..end))
+            else {
+                continue;
+            };
+            if visual_line_length(string_data, TAB_WIDTH) > config.max_line_length {
+                continue;
+            }
+        }
         let visual_len = visual_line_length(line, TAB_WIDTH);
         if visual_len > config.max_line_length {
             diagnostics.push(Diagnostic::warning(
@@ -35,10 +79,11 @@ pub fn check_max_line_length(
 fn visual_line_length(line: &str, tab_width: usize) -> usize {
     let mut col = 0;
     for ch in line.chars() {
-        if ch == '\t' {
-            col = (col / tab_width + 1) * tab_width;
-        } else {
-            col += 1;
+        match ch {
+            '\t' => col = (col / tab_width + 1) * tab_width,
+            // A `\r` left in a string's CRLF line ending takes no columns.
+            '\r' => {}
+            _ => col += 1,
         }
     }
     col
@@ -50,10 +95,10 @@ pub fn check_trailing_whitespace(
     file: &ScriptFile,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let strings = StringLines::new(tokens, file.lines.len());
+    let string_line_mask = StringLines::new(tokens, file.lines.len());
     for (i, line) in file.lines.iter().enumerate() {
         let line_num = i + 1;
-        if strings.ends_inside(i) {
+        if string_line_mask.ends_inside(i) {
             continue;
         }
         if line.ends_with(' ') || line.ends_with('\t') {
@@ -116,10 +161,10 @@ pub fn check_indentation_style(
     config: &Config,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let strings = StringLines::new(tokens, file.lines.len());
+    let string_line_mask = StringLines::new(tokens, file.lines.len());
     for (i, line) in file.lines.iter().enumerate() {
         let line_num = i + 1;
-        if line.is_empty() || strings.is_interior(i) {
+        if line.is_empty() || string_line_mask.is_interior(i) {
             continue;
         }
 
@@ -621,12 +666,12 @@ pub fn check_one_statement_per_line(
 /// Check for runs of 3+ consecutive blank lines anywhere in the file,
 /// except inside a multi-line string, where a blank line is content.
 pub fn check_blank_lines(tokens: &[Token], file: &ScriptFile, diagnostics: &mut Vec<Diagnostic>) {
-    let strings = StringLines::new(tokens, file.lines.len());
+    let string_line_mask = StringLines::new(tokens, file.lines.len());
     let mut consecutive_blank = 0;
     let mut run_start_idx: usize = 0;
 
     for (idx, line) in file.lines.iter().enumerate() {
-        if line.trim().is_empty() && !strings.ends_inside(idx) {
+        if line.trim().is_empty() && !string_line_mask.ends_inside(idx) {
             consecutive_blank += 1;
             if consecutive_blank == 1 {
                 run_start_idx = idx;
@@ -879,7 +924,11 @@ pub fn check_trailing_comma(
                 // prettier) writes it. GDScript has no block comments, so
                 // "close is on a later line than the last item" is equivalent
                 // to "close is the first non-whitespace token on its line".
-                let closer_starts_own_line = tokens[k].span.line > tokens[last_item].span.line;
+                // The last item can be a string spanning lines, so compare
+                // with the line it ends on, not the one it starts on.
+                let last_item_end_line =
+                    tokens[last_item].span.line + tokens[last_item].text.matches('\n').count();
+                let closer_starts_own_line = tokens[k].span.line > last_item_end_line;
 
                 if last_item > i
                     && tokens[last_item].kind != TokenKind::Comma
@@ -1723,9 +1772,74 @@ mod tests {
         let file = make_file(&[&long_line, ""]);
         let config = Config::default();
         let mut diags = Vec::new();
-        check_max_line_length(&file, &config, &mut diags);
+        check_max_line_length(
+            &tokenize(&file.lines.join("\n")),
+            &file,
+            &config,
+            &mut diags,
+        );
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("120"));
+    }
+
+    #[test]
+    fn max_line_length_skips_multiline_string_contents() {
+        let long = "x".repeat(120);
+        // The opening line is code and still counts; the lines after it,
+        // closing line included, are string data.
+        let source = format!("var s = \"\"\"{long}\n{long}\n{long}\"\"\"\n");
+        let lines: Vec<&str> = source.split('\n').collect();
+        let file = make_file(&lines);
+        let mut diags = Vec::new();
+        check_max_line_length(&tokenize(&source), &file, &Config::default(), &mut diags);
+        let reported: Vec<usize> = diags.iter().map(|d| d.span.line).collect();
+        assert_eq!(reported, vec![1]);
+    }
+
+    #[test]
+    fn max_line_length_reports_code_after_a_closing_quote() {
+        // The string data on the closing line is short; the code after it
+        // is what makes the line too long, so it is reported.
+        let args: Vec<String> = (0..14).map(|n| format!("value_{n:02}")).collect();
+        let source = format!(
+            "func f() -> String:\n\treturn \"\"\"\nabc\n\"\"\" % [{}]\n",
+            args.join(", ")
+        );
+        let lines: Vec<&str> = source.split('\n').collect();
+        let file = make_file(&lines);
+        let mut diags = Vec::new();
+        check_max_line_length(&tokenize(&source), &file, &Config::default(), &mut diags);
+        let reported: Vec<usize> = diags.iter().map(|d| d.span.line).collect();
+        assert_eq!(reported, vec![4]);
+    }
+
+    #[test]
+    fn max_line_length_reports_code_between_two_multiline_strings() {
+        // One literal closes and another opens on line 2; the code between
+        // them makes the line too long.
+        let args: Vec<String> = (0..14).map(|n| format!("value_{n:02}")).collect();
+        let source = format!(
+            "var s = \"\"\"\nabc\"\"\" + str([{}]) + \"\"\"\ndef\"\"\"\n",
+            args.join(", ")
+        );
+        let lines: Vec<&str> = source.split('\n').collect();
+        let file = make_file(&lines);
+        let mut diags = Vec::new();
+        check_max_line_length(&tokenize(&source), &file, &Config::default(), &mut diags);
+        let reported: Vec<usize> = diags.iter().map(|d| d.span.line).collect();
+        assert_eq!(reported, vec![2]);
+    }
+
+    #[test]
+    fn trailing_comma_ignores_closer_after_a_multiline_string() {
+        // `"""}` closes the literal and the dictionary on one line, so the
+        // closer doesn't start its own line and no comma is wanted.
+        let source = "var d = {\"a\": 1, \"b\": \"\"\"\nx\n\"\"\"}\n";
+        let lines: Vec<&str> = source.split('\n').collect();
+        let file = make_file(&lines);
+        let mut diags = Vec::new();
+        check_trailing_comma(&tokenize(source), &file, &mut diags);
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
     }
 
     #[test]
@@ -1733,7 +1847,12 @@ mod tests {
         let file = make_file(&["var x = 5", ""]);
         let config = Config::default();
         let mut diags = Vec::new();
-        check_max_line_length(&file, &config, &mut diags);
+        check_max_line_length(
+            &tokenize(&file.lines.join("\n")),
+            &file,
+            &config,
+            &mut diags,
+        );
         assert!(diags.is_empty());
     }
 

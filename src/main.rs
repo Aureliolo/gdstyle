@@ -650,7 +650,7 @@ fn run_fmt(paths: &[PathBuf], check: bool, diff: bool, config_path: Option<&Path
         })
         .collect();
 
-    let mut would_change = false;
+    let mut changed_count = 0;
     let mut formatted_count = 0;
     for r in &format_results {
         if let Some(e) = &r.read_error {
@@ -669,7 +669,7 @@ fn run_fmt(paths: &[PathBuf], check: bool, diff: bool, config_path: Option<&Path
         if !r.changed {
             continue;
         }
-        would_change = true;
+        changed_count += 1;
         if diff {
             if let (Some(src), Some(fmt)) = (&r.source, &r.formatted) {
                 print_diff(&r.path, src, fmt);
@@ -683,13 +683,13 @@ fn run_fmt(paths: &[PathBuf], check: bool, diff: bool, config_path: Option<&Path
     }
 
     if check || diff {
-        if would_change {
+        if changed_count > 0 {
             println!(
                 "{}",
                 format!(
                     "{} file{} would be reformatted.",
-                    files.len(),
-                    if files.len() == 1 { "" } else { "s" }
+                    changed_count,
+                    if changed_count == 1 { "" } else { "s" }
                 )
                 .yellow()
             );
@@ -723,8 +723,10 @@ fn print_diff(path: &Path, original: &str, formatted: &str) {
     println!("--- a/{}", path_str);
     println!("+++ b/{}", path_str);
 
-    let orig_lines: Vec<&str> = original.lines().collect();
-    let fmt_lines: Vec<&str> = formatted.lines().collect();
+    // Split on `\n` only, so a line keeps its `\r` and a change that only
+    // touches line endings still shows up as a changed line.
+    let orig_lines: Vec<&str> = original.split_terminator('\n').collect();
+    let fmt_lines: Vec<&str> = formatted.split_terminator('\n').collect();
 
     // Simple line-by-line diff.
     let max_lines = orig_lines.len().max(fmt_lines.len());
@@ -733,16 +735,22 @@ fn print_diff(path: &Path, original: &str, formatted: &str) {
         let fmt = fmt_lines.get(i).copied().unwrap_or("");
         if orig != fmt {
             if !orig.is_empty() || i < orig_lines.len() {
-                println!("{}", format!("-{}", orig).red());
+                println!("{}", format!("-{}", show_carriage_returns(orig)).red());
             }
             if !fmt.is_empty() || i < fmt_lines.len() {
-                println!("{}", format!("+{}", fmt).green());
+                println!("{}", format!("+{}", show_carriage_returns(fmt)).green());
             }
         } else {
-            println!(" {}", orig);
+            println!(" {}", orig.trim_end_matches('\r'));
         }
     }
     println!();
+}
+
+/// `line` with each `\r` shown as `^M`, so lines that differ only in line
+/// endings don't print identically.
+fn show_carriage_returns(line: &str) -> String {
+    line.replace('\r', "^M")
 }
 
 fn run_init(force: bool) {

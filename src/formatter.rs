@@ -12,6 +12,11 @@ use crate::token::{StringLines, Token, TokenKind};
 /// which only fixes flagged violations. The result is idempotent: formatting
 /// already-formatted source returns it unchanged.
 ///
+/// Line endings are kept: a CRLF file comes back as CRLF, like it does from
+/// `--fix`, and a string that spans lines keeps its own line endings, since
+/// Godot keeps a `\r` inside a string as part of its value. See
+/// [`crate::linter::restore_line_endings`].
+///
 /// # Example
 ///
 /// ```
@@ -36,10 +41,18 @@ pub fn format_source(source: &str, config: &Config) -> String {
         result = formatted;
     }
 
-    result
+    crate::linter::restore_line_endings(source, &result)
 }
 
 fn format_pass(source: &str, config: &Config) -> String {
+    // Lex once to learn whether any string runs over several lines. The
+    // string-aware passes only need a mask when one does, which most files
+    // never have, so they can skip lexing the source again.
+    format_pass_with(source, config, SpanningStrings::find(source))
+}
+
+/// [`format_pass`] with the [`SpanningStrings`] answer for `source` given.
+fn format_pass_with(source: &str, config: &Config, spanning_strings: SpanningStrings) -> String {
     let mut result = source.to_string();
 
     // 1. Reorder class members FIRST, before any line-changing transformations,
@@ -51,13 +64,13 @@ fn format_pass(source: &str, config: &Config) -> String {
     //    output is re-parsed to verify it has the same set of class members
     //    as the input: if anything mutated, we keep the original.
     result = safe_reorder_class_members(&result);
-    result = safe_reorder_inner_classes(&result);
+    result = safe_reorder_inner_classes(&result, spanning_strings);
 
-    // 2. Normalize indentation.
-    result = normalize_indentation(&result, config);
-
-    // 2. Strip trailing whitespace from every line.
-    result = strip_trailing_whitespace(&result);
+    // 2. Normalize indentation, then strip trailing whitespace. Neither pass
+    //    adds or removes lines, so one string-line mask serves both.
+    let string_line_mask = string_lines(&result, spanning_strings);
+    result = normalize_indentation(&result, config, &string_line_mask);
+    result = strip_trailing_whitespace(&result, &string_line_mask);
 
     // 3a. Normalize blank lines BETWEEN top-level class members to their
     //     canonical counts (0 between header items, 1 between member
@@ -67,7 +80,7 @@ fn format_pass(source: &str, config: &Config) -> String {
 
     // 3b. Backstop for blank lines INSIDE function bodies and anywhere the
     //     member-aware pass didn't touch: collapse 3+ to 2.
-    result = collapse_blank_lines(&result);
+    result = collapse_blank_lines(&result, spanning_strings);
 
     // 4. Replace && || ! with and or not.
     result = normalize_boolean_operators(&result);
@@ -91,24 +104,58 @@ fn format_pass(source: &str, config: &Config) -> String {
     result = lint_then_fix(&result, config);
 
     // 11. Break long lines by wrapping at commas inside delimiters.
-    result = break_long_lines(&result, config);
+    result = break_long_lines(&result, config, spanning_strings);
 
     result
 }
 
-/// The lines of `source` that multi-line string literals cover; see
-/// [`StringLines`]. Their whitespace, blank runs and length are string data.
-fn string_lines(source: &str) -> StringLines {
-    StringLines::new(&Lexer::new(source).tokenize(), source.split('\n').count())
+/// Whether a source has a string literal that runs over more than one line:
+/// a `"""` literal, a backslash continuation, or a quoted string with a raw
+/// newline, which Godot also accepts.
+///
+/// The passes in [`format_pass_with`] keep string literals intact: they move,
+/// re-indent or wrap whole lines around them but don't split or join one. So
+/// the answer for a pass's input holds for every intermediate result. The one
+/// known exception is single-line enum expansion, which can split a string
+/// enum value at its commas; that only happens on invalid GDScript, since enum
+/// values must be integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpanningStrings {
+    Present,
+    Absent,
 }
 
-fn normalize_indentation(source: &str, config: &Config) -> String {
+impl SpanningStrings {
+    fn find(source: &str) -> Self {
+        let is_spanning =
+            |token: &Token| matches!(token.kind, TokenKind::String(_)) && token.text.contains('\n');
+        if Lexer::new(source).tokenize().iter().any(is_spanning) {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+/// The lines of `source` that multi-line string literals cover; see
+/// [`StringLines`]. Their whitespace, blank runs and length are string data.
+/// With [`SpanningStrings::Absent`] no line is covered, so the source isn't
+/// lexed.
+fn string_lines(source: &str, spanning_strings: SpanningStrings) -> StringLines {
+    let line_count = source.split('\n').count();
+    match spanning_strings {
+        SpanningStrings::Absent => StringLines::new(&[], line_count),
+        SpanningStrings::Present => StringLines::new(&Lexer::new(source).tokenize(), line_count),
+    }
+}
+
+/// `string_line_mask` must describe `source` line for line.
+fn normalize_indentation(source: &str, config: &Config, string_line_mask: &StringLines) -> String {
     let lines: Vec<&str> = source.split('\n').collect();
-    let strings = string_lines(source);
     let mut result = Vec::new();
 
     for (idx, line) in lines.iter().enumerate() {
-        if line.is_empty() || strings.is_interior(idx) {
+        if line.is_empty() || string_line_mask.is_interior(idx) {
             result.push(line.to_string());
             continue;
         }
@@ -139,13 +186,13 @@ fn normalize_indentation(source: &str, config: &Config) -> String {
     result.join("\n")
 }
 
-fn strip_trailing_whitespace(source: &str) -> String {
-    let strings = string_lines(source);
+/// `string_line_mask` must describe `source` line for line.
+fn strip_trailing_whitespace(source: &str, string_line_mask: &StringLines) -> String {
     source
         .split('\n')
         .enumerate()
         .map(|(idx, line)| {
-            if strings.ends_inside(idx) {
+            if string_line_mask.ends_inside(idx) {
                 line.to_string()
             } else {
                 line.trim_end().to_string()
@@ -279,19 +326,18 @@ fn tighten_warning_ignore_region_markers(source: &str, tokens: &[Token]) -> Stri
     }
 
     let lines: Vec<&str> = source.split('\n').collect();
-    let is_blank = |line_number: usize| {
-        lines
-            .get(line_number - 1)
-            .is_some_and(|line| line.trim().is_empty())
-    };
+    // A blank-looking line inside a multi-line string is string data, not
+    // spacing: it is never dropped, and it ends a run of blank lines.
+    let string_line_mask = StringLines::new(tokens, lines.len());
     let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
     // Line number (1-indexed) of the last non-blank line seen so far.
     let mut last_code_line: Option<usize> = None;
-    let mut pending_blank_count = 0;
+    // Blank lines since `last_code_line`, as written, in case they stay.
+    let mut pending_blank_lines: Vec<&str> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
-        if is_blank(line_number) {
-            pending_blank_count += 1;
+        if line.trim().is_empty() && !string_line_mask.is_interior(index) {
+            pending_blank_lines.push(line);
             continue;
         }
         let follows_start_marker =
@@ -300,15 +346,15 @@ fn tighten_warning_ignore_region_markers(source: &str, tokens: &[Token]) -> Stri
         // against, so its leading blank lines stay.
         let closes_region = restore_lines.contains(&line_number) && last_code_line.is_some();
         if !follows_start_marker && !closes_region {
-            kept.extend(std::iter::repeat_n("", pending_blank_count));
+            kept.append(&mut pending_blank_lines);
         }
-        pending_blank_count = 0;
+        pending_blank_lines.clear();
         kept.push(line);
         last_code_line = Some(line_number);
     }
     // Trailing blank lines (including the empty piece after the final
     // newline) are not this pass's business.
-    kept.extend(std::iter::repeat_n("", pending_blank_count));
+    kept.append(&mut pending_blank_lines);
     kept.join("\n")
 }
 
@@ -593,14 +639,15 @@ fn normalize_member_spacing(source: &str, config: &Config) -> String {
     result.join("\n")
 }
 
-fn collapse_blank_lines(source: &str) -> String {
+/// `spanning_strings` is the [`SpanningStrings`] answer for `source`.
+fn collapse_blank_lines(source: &str, spanning_strings: SpanningStrings) -> String {
     let lines: Vec<&str> = source.split('\n').collect();
-    let strings = string_lines(source);
+    let string_line_mask = string_lines(source, spanning_strings);
     let mut result = Vec::new();
     let mut blank_count = 0;
 
     for (idx, line) in lines.iter().enumerate() {
-        if line.trim().is_empty() && !strings.ends_inside(idx) {
+        if line.trim().is_empty() && !string_line_mask.ends_inside(idx) {
             blank_count += 1;
             if blank_count <= 2 {
                 result.push(String::new());
@@ -803,11 +850,13 @@ fn lint_then_fix(source: &str, config: &Config) -> String {
 /// - Lines without delimiters (operator expressions, long strings)
 /// - Lines where the content inside delimiters has only one item
 /// - Lines where breaking wouldn't reduce the length below the limit
-fn break_long_lines(source: &str, config: &Config) -> String {
+///
+/// `spanning_strings` is the [`SpanningStrings`] answer for `source`.
+fn break_long_lines(source: &str, config: &Config, spanning_strings: SpanningStrings) -> String {
     const TAB_WIDTH: usize = 4;
     let max_len = config.max_line_length;
     let lines: Vec<&str> = source.split('\n').collect();
-    let strings = string_lines(source);
+    let string_line_mask = string_lines(source, spanning_strings);
     let mut result: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -815,7 +864,7 @@ fn break_long_lines(source: &str, config: &Config) -> String {
         let line = lines[i];
         let visual_len = visual_line_len(line, TAB_WIDTH);
 
-        if visual_len <= max_len || strings.is_interior(i) {
+        if visual_len <= max_len || string_line_mask.is_interior(i) {
             result.push(line.to_string());
             i += 1;
             continue;
@@ -840,10 +889,11 @@ fn break_long_lines(source: &str, config: &Config) -> String {
 fn visual_line_len(line: &str, tab_width: usize) -> usize {
     let mut col = 0;
     for ch in line.chars() {
-        if ch == '\t' {
-            col = (col / tab_width + 1) * tab_width;
-        } else {
-            col += 1;
+        match ch {
+            '\t' => col = (col / tab_width + 1) * tab_width,
+            // A `\r` left in a string's CRLF line ending takes no columns.
+            '\r' => {}
+            _ => col += 1,
         }
     }
     col
@@ -1336,8 +1386,8 @@ fn safe_reorder_class_members(source: &str) -> String {
 /// Reorder the members of each inner class, unless doing so would change
 /// which code a `@warning_ignore_start` region covers (see
 /// `changes_warning_ignore_regions`).
-fn safe_reorder_inner_classes(source: &str) -> String {
-    let reordered = reorder_inner_classes(source);
+fn safe_reorder_inner_classes(source: &str, spanning_strings: SpanningStrings) -> String {
+    let reordered = reorder_inner_classes(source, spanning_strings);
     if changes_warning_ignore_regions(source, &reordered) {
         return source.to_string();
     }
@@ -1618,7 +1668,12 @@ fn collect_member_anchors(members: &[ClassMember], source_lines: &[&str]) -> Vec
 
 /// For each anchor, walk backward from its declaration line to find attached
 /// comments / annotations: those belong to the member and move with it.
-fn compute_attached_starts(merged: &[Anchor], lines: &[&str]) -> Vec<usize> {
+/// The walk stops at string data, even a line that looks like a comment.
+fn compute_attached_starts(
+    merged: &[Anchor],
+    lines: &[&str],
+    string_line_mask: &StringLines,
+) -> Vec<usize> {
     let mut attached_starts: Vec<usize> = Vec::new();
     for (i, &(decl_line, _, _)) in merged.iter().enumerate() {
         let prev_boundary = if i > 0 { merged[i - 1].0 + 1 } else { 0 };
@@ -1626,12 +1681,18 @@ fn compute_attached_starts(merged: &[Anchor], lines: &[&str]) -> Vec<usize> {
         let mut j = decl_line;
         while j > prev_boundary {
             j -= 1;
+            if string_line_mask.is_interior(j) {
+                break;
+            }
             let content = if j < lines.len() { lines[j].trim() } else { "" };
             if content.starts_with('#') || content.starts_with('@') {
                 start = j;
             } else if content.is_empty() {
                 // Blank line: keep looking only if a comment sits directly above.
-                let above = if j > prev_boundary && j - 1 < lines.len() {
+                let above = if j > prev_boundary
+                    && j - 1 < lines.len()
+                    && !string_line_mask.is_interior(j - 1)
+                {
                     lines[j - 1].trim()
                 } else {
                     ""
@@ -1674,7 +1735,8 @@ fn reorder_class_members(source: &str) -> String {
         return move_class_decl_before_doc_comments(source);
     }
 
-    let attached_starts = compute_attached_starts(&merged, &lines);
+    let string_line_mask = StringLines::new(&tokens, lines.len());
+    let attached_starts = compute_attached_starts(&merged, &lines, &string_line_mask);
 
     // A member carrying a `# gdstyle:ignore=order/class-member-order` directive
     // opts out of reordering: it is pinned to its source position while the
@@ -1896,6 +1958,15 @@ fn move_class_decl_before_doc_comments(source: &str) -> String {
         }
     }
 
+    // The search above reads raw lines, so it can match text inside a
+    // multi-line string (a script template, say). Moving those lines would
+    // rewrite the string, so leave the source alone if any of them is string
+    // data. Lexing only here keeps the common case cheap.
+    let string_line_mask = StringLines::new(&Lexer::new(source).tokenize(), lines.len());
+    if (doc_start..=decl_end).any(|idx| string_line_mask.is_interior(idx)) {
+        return source.to_string();
+    }
+
     // Reconstruct: lines before docs, then decl lines, blank, doc lines, rest.
     let mut result: Vec<String> = Vec::new();
     for line in &lines[..doc_start] {
@@ -1919,13 +1990,23 @@ fn move_class_decl_before_doc_comments(source: &str) -> String {
 }
 
 /// Find inner class blocks in the source and recursively reorder their members.
-fn reorder_inner_classes(source: &str) -> String {
+///
+/// The body is dedented, reordered and re-indented line by line, so lines
+/// inside a multi-line string are kept out of it: they are copied verbatim,
+/// never end the body, and never start a class.
+fn reorder_inner_classes(source: &str, spanning_strings: SpanningStrings) -> String {
     let lines: Vec<&str> = source.split('\n').collect();
+    let string_line_mask = string_lines(source, spanning_strings);
     let mut result: Vec<String> = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
+        if string_line_mask.is_interior(i) {
+            result.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
         // Detect inner class declaration: starts with "class " at indent > 0.
         let indent: String = lines[i]
             .chars()
@@ -1942,10 +2023,18 @@ fn reorder_inner_classes(source: &str) -> String {
             let body_start = i;
             while i < lines.len() {
                 let line = lines[i];
+                if string_line_mask.is_interior(i) {
+                    // String data belongs to the member that opened it.
+                    i += 1;
+                    continue;
+                }
                 if line.trim().is_empty() {
                     // Blank line: include if the next non-blank line is still in the body.
                     let mut next_nonblank = i + 1;
-                    while next_nonblank < lines.len() && lines[next_nonblank].trim().is_empty() {
+                    while next_nonblank < lines.len()
+                        && (lines[next_nonblank].trim().is_empty()
+                            || string_line_mask.is_interior(next_nonblank))
+                    {
                         next_nonblank += 1;
                     }
                     if next_nonblank < lines.len() {
@@ -1975,8 +2064,11 @@ fn reorder_inner_classes(source: &str) -> String {
                 // Extract body, dedent by one level, reorder, re-indent.
                 let body_lines: Vec<String> = lines[body_start..body_end]
                     .iter()
-                    .map(|l| {
-                        if l.trim().is_empty() {
+                    .enumerate()
+                    .map(|(offset, l)| {
+                        if string_line_mask.is_interior(body_start + offset) {
+                            l.to_string()
+                        } else if l.trim().is_empty() {
                             String::new()
                         } else if l.starts_with(&format!("{}\t", indent)) {
                             l[indent.len() + 1..].to_string()
@@ -1998,8 +2090,11 @@ fn reorder_inner_classes(source: &str) -> String {
 
                 // Re-indent and add to result.
                 let member_indent = format!("{}\t", indent);
-                for line in reordered.split('\n') {
-                    if line.trim().is_empty() {
+                let reordered_mask = string_lines(&reordered, spanning_strings);
+                for (idx, line) in reordered.split('\n').enumerate() {
+                    if reordered_mask.is_interior(idx) {
+                        result.push(line.to_string());
+                    } else if line.trim().is_empty() {
                         result.push(String::new());
                     } else {
                         result.push(format!("{}{}", member_indent, line));
@@ -2071,7 +2166,8 @@ mod tests {
     #[test]
     fn test_strip_trailing_whitespace() {
         let source = "var x = 5   \nvar y = 10\t\t\n";
-        let result = strip_trailing_whitespace(source);
+        let result =
+            strip_trailing_whitespace(source, &string_lines(source, SpanningStrings::Absent));
         assert_eq!(result, "var x = 5\nvar y = 10\n");
     }
 
@@ -2079,11 +2175,126 @@ mod tests {
     fn line_passes_skip_multiline_string_contents() {
         // Everything between the opening and closing `"""` is string data.
         let source = "extends Node\n\nconst T = \"\"\"a   \n\n\n\n    b\n\tc\n\"\"\"\n";
-        assert_eq!(strip_trailing_whitespace(source), source);
-        assert_eq!(collapse_blank_lines(source), source);
-        assert_eq!(normalize_indentation(source, &Config::default()), source);
+        assert_eq!(SpanningStrings::find(source), SpanningStrings::Present);
+        let string_line_mask = string_lines(source, SpanningStrings::Present);
+        assert_eq!(strip_trailing_whitespace(source, &string_line_mask), source);
+        assert_eq!(
+            collapse_blank_lines(source, SpanningStrings::Present),
+            source
+        );
+        assert_eq!(
+            normalize_indentation(source, &Config::default(), &string_line_mask),
+            source
+        );
         let long = format!("var s = \"\"\"\nf({})\n\"\"\"\n", "a, ".repeat(60));
-        assert_eq!(break_long_lines(&long, &Config::default()), long);
+        assert_eq!(
+            break_long_lines(&long, &Config::default(), SpanningStrings::Present),
+            long
+        );
+    }
+
+    #[test]
+    fn spanning_strings_detects_every_kind_of_spanning_literal() {
+        use SpanningStrings::{Absent, Present};
+        // Triple-quoted, a quoted string with a raw newline (Godot accepts
+        // it), and a backslash continuation.
+        assert_eq!(SpanningStrings::find("var s = \"\"\"a\nb\"\"\"\n"), Present);
+        assert_eq!(SpanningStrings::find("var s = \"a\nb\"\n"), Present);
+        assert_eq!(SpanningStrings::find("var s = 'a\\\nb'\n"), Present);
+        // Single-line strings, including a `"""` one, and no strings at all.
+        let single = "var s = \"a\"\nvar t = \"\"\"b\"\"\"\n# \"\"\"\n";
+        assert_eq!(SpanningStrings::find(single), Absent);
+        assert_eq!(SpanningStrings::find("var x = 1\n"), Absent);
+    }
+
+    #[test]
+    fn skipping_masks_without_spanning_strings_changes_no_output() {
+        // `format_pass` skips the string masks when `SpanningStrings::find`
+        // says there are none. Always building them must give the same
+        // output on every fixture and example.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for dir in ["tests/fixtures", "examples"] {
+            let entries = std::fs::read_dir(root.join(dir)).expect("fixture dir is readable");
+            for entry in entries {
+                let path = entry.expect("fixture dir entry is readable").path();
+                if path.extension().is_none_or(|ext| ext != "gd") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("fixture is UTF-8");
+                let config = Config::default();
+                assert_eq!(
+                    format_pass(&source, &config),
+                    format_pass_with(&source, &config, SpanningStrings::Present),
+                    "{}",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 10, "only {checked} fixtures found");
+    }
+
+    #[test]
+    fn inner_class_reorder_keeps_multiline_string_contents() {
+        // The body is dedented and re-indented line by line; string lines
+        // must come through as they are: a four-space line, a spaces-only
+        // line, and a line that looks like a class header.
+        let source = "extends Node\n\n\nclass A:\n\tvar v = 1\n\tconst X = \"\"\"\nclass Fake:\n    x\n   \n\t\"\"\"\n";
+        let formatted = format_source(source, &Config::default());
+        assert!(
+            formatted.contains("\tconst X = \"\"\"\nclass Fake:\n    x\n   \n\t\"\"\"\n"),
+            "{formatted:?}"
+        );
+        assert!(
+            formatted.find("const X") < formatted.find("var v"),
+            "{formatted:?}"
+        );
+    }
+
+    #[test]
+    fn inner_class_reorder_keeps_crlf_blank_line_in_string() {
+        // Reduced from a real plugin: the blank line inside the string is
+        // `\r` once the file is normalized and must keep it.
+        let source = "class A extends B:\r\n\tconst X = \"\"\"\r\n\r\n\tconst Y = \"\"\"\r\n";
+        assert_eq!(format_source(source, &Config::default()), source);
+    }
+
+    #[test]
+    fn region_marker_pass_keeps_blank_looking_string_lines() {
+        // A column-1 region marker makes the pass rebuild the file's blank
+        // lines; lines inside a string are data, with LF or CRLF.
+        let crlf = "extends Node\r\n\r\nconst T = \"\"\"\r\na\r\n\r\nb\r\n\"\"\"\r\n@warning_ignore_restore(\"unused\")\r\n";
+        assert_eq!(format_source(crlf, &Config::default()), crlf);
+        let lf = "extends Node\n\nconst T = \"\"\"\na\n   \n\t\nb\n\"\"\"\n@warning_ignore_restore(\"unused\")\n";
+        assert_eq!(format_source(lf, &Config::default()), lf);
+    }
+
+    #[test]
+    fn doc_comment_move_leaves_a_template_string_alone() {
+        let source =
+            "extends Node\n\nconst TEMPLATE = \"\"\"\n## Generated script\nextends Node\n\"\"\"\n";
+        assert_eq!(format_source(source, &Config::default()), source);
+    }
+
+    #[test]
+    fn reorder_does_not_attach_a_comment_looking_closing_line() {
+        // Walking back from `var b` must stop at the string's closing line,
+        // even though it starts with `#`.
+        let source = "extends Node\n\nfunc f():\n\tpass\n\n\nconst A = \"\"\"\nx\n\n# note\n## doc\"\"\"\nvar b = 1\n";
+        let formatted = format_source(source, &Config::default());
+        assert!(
+            formatted.contains("const A = \"\"\"\nx\n\n# note\n## doc\"\"\"\n"),
+            "{formatted:?}"
+        );
+    }
+
+    #[test]
+    fn format_source_keeps_quoted_string_with_raw_newline() {
+        // A plain `"..."` literal can hold raw newlines too; its contents are
+        // data just like a `"""` literal's.
+        let source = "extends Node\n\nconst T = \"a   \n\n\n\n    b\n\tc\"\n";
+        assert_eq!(format_source(source, &Config::default()), source);
     }
 
     #[test]
@@ -2138,7 +2349,7 @@ mod tests {
     #[test]
     fn test_collapse_blank_lines() {
         let source = "a\n\n\n\n\nb\n";
-        let result = collapse_blank_lines(source);
+        let result = collapse_blank_lines(source, SpanningStrings::Absent);
         assert_eq!(result, "a\n\n\nb\n");
     }
 

@@ -3874,17 +3874,102 @@ fn formatter_handles_crlf_input() {
     let source = "var x = 'hello'\r\nvar y = 'world'\r\n";
     let config = default_config();
     let formatted = formatter::format_source(source, &config);
-    // Should normalize to LF and convert quotes
+    // Quotes are normalized and the CRLF line endings are kept.
+    assert_eq!(formatted, "var x = \"hello\"\r\nvar y = \"world\"\r\n");
+    assert_eq!(formatter::format_source(&formatted, &config), formatted);
+}
+
+// Godot keeps the `\r` of a CRLF line inside a multi-line string, so turning
+// the file into LF would change the string's value.
+#[test]
+fn formatter_keeps_crlf_inside_multiline_strings() {
+    let source = "extends Node\r\n\r\nconst T = \"\"\"a   \r\n\r\n\r\n\r\n    b\r\n\"\"\"\r\n";
+    let formatted = formatter::format_source(source, &default_config());
+    assert_eq!(formatted, source);
+}
+
+// A string keeps its own line endings even when they differ from the file's:
+// an LF string in a CRLF file must not gain `\r`s, which would change its value.
+#[test]
+fn formatter_and_fixer_keep_lf_string_in_crlf_file() {
+    let source = "extends Node\r\n\r\nconst T = \"\"\"a\nb\n\"\"\"\r\nvar x = 1   \r\n";
+    let config = default_config();
+    // `fmt` also puts a blank line between the constant and the variable.
+    let formatted = formatter::format_source(source, &config);
+    assert_eq!(
+        formatted,
+        "extends Node\r\n\r\nconst T = \"\"\"a\nb\n\"\"\"\r\n\r\nvar x = 1\r\n"
+    );
+    assert_eq!(formatter::format_source(&formatted, &config), formatted);
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    assert_eq!(
+        fixer::apply_fixes(source, &diagnostics, true),
+        "extends Node\r\n\r\nconst T = \"\"\"a\nb\n\"\"\"\r\nvar x = 1\r\n"
+    );
+}
+
+// Quote normalization rewrites a single-quoted string; its LF line break must
+// survive in a CRLF file rather than take the file's CRLF.
+#[test]
+fn quote_normalization_keeps_a_strings_line_endings() {
+    let source = "extends Node\r\n\r\nvar s = 'a\nb'\r\nvar x = 1\r\n";
+    let config = default_config();
+    let formatted = formatter::format_source(source, &config);
+    assert_eq!(
+        formatted,
+        "extends Node\r\n\r\nvar s = \"a\nb\"\r\nvar x = 1\r\n"
+    );
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    assert_eq!(fixer::apply_fixes(source, &diagnostics, true), formatted);
+}
+
+// The file's style comes from the line breaks outside strings: one CRLF
+// inside a string must not turn an LF file into CRLF.
+#[test]
+fn crlf_inside_a_string_keeps_an_lf_file_lf() {
+    let source = "extends Node\n\nconst T = \"\"\"a\r\nb\"\"\"\nvar x = 1   \n";
+    let config = default_config();
+    assert_eq!(
+        formatter::format_source(source, &config),
+        "extends Node\n\nconst T = \"\"\"a\r\nb\"\"\"\n\nvar x = 1\n"
+    );
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    assert_eq!(
+        fixer::apply_fixes(source, &diagnostics, true),
+        "extends Node\n\nconst T = \"\"\"a\r\nb\"\"\"\nvar x = 1\n"
+    );
+}
+
+// Two strings with the same text but different line endings must each keep
+// their own when the reorder swaps them.
+#[test]
+fn reordered_strings_keep_their_own_line_endings() {
+    let source = "extends Node\r\n\r\nvar b = \"\"\"x\r\ny\"\"\"\r\nconst A = \"\"\"x\ny\"\"\"\r\n";
+    let formatted = formatter::format_source(source, &default_config());
     assert!(
-        formatted.contains("\"hello\""),
-        "quotes should be normalized, got:\n{}",
-        formatted
+        formatted.contains("const A = \"\"\"x\ny\"\"\""),
+        "{formatted:?}"
     );
     assert!(
-        !formatted.contains('\r'),
-        "\\r should be stripped from output, got:\n{:?}",
-        formatted
+        formatted.contains("var b = \"\"\"x\r\ny\"\"\""),
+        "{formatted:?}"
     );
+    assert!(
+        formatted.find("const A") < formatted.find("var b"),
+        "{formatted:?}"
+    );
+}
+
+// Godot doesn't treat a `\r` without a following `\n` as a line break. It must
+// survive as-is: turning it into `\n` splits a comment (leaving code behind)
+// or changes a string's value, and must not flip the file to CRLF.
+#[test]
+fn formatter_keeps_stray_carriage_returns() {
+    let source = "extends Node\n\n# odd\r comment\nvar s = \"a\rb\"\n";
+    let config = default_config();
+    assert_eq!(formatter::format_source(source, &config), source);
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    assert_eq!(fixer::apply_fixes(source, &diagnostics, true), source);
 }
 
 // Regression test for https://github.com/atelico/gdstyle/issues/24: --fix
@@ -6620,4 +6705,62 @@ fn lint_ignores_layout_inside_multiline_strings() {
         })
         .collect();
     assert!(layout.is_empty(), "unexpected diagnostics: {:?}", layout);
+}
+
+/// The value of every string literal in `source`, sorted so the comparison
+/// ignores reordering.
+fn string_values(source: &str) -> Vec<String> {
+    let mut values: Vec<String> = Lexer::new(source)
+        .tokenize()
+        .into_iter()
+        .filter_map(|token| match token.kind {
+            gdstyle::token::TokenKind::String(info) => Some(info.value),
+            _ => None,
+        })
+        .collect();
+    values.sort();
+    values
+}
+
+// `fmt` and `--fix` may move, re-indent and re-quote strings, but never change
+// a value.
+// Checked on every fixture and example, as written and converted to CRLF.
+#[test]
+fn formatting_and_fixing_never_change_a_string_value() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = default_config();
+    let mut checked = 0;
+    for dir in ["tests/fixtures", "examples"] {
+        for entry in std::fs::read_dir(root.join(dir)).expect("fixture dir is readable") {
+            let path = entry.expect("fixture dir entry is readable").path();
+            if path.extension().is_none_or(|ext| ext != "gd") {
+                continue;
+            }
+            let lf = std::fs::read_to_string(&path)
+                .expect("fixture is UTF-8")
+                .replace("\r\n", "\n");
+            for source in [lf.clone(), lf.replace('\n', "\r\n")] {
+                let formatted = formatter::format_source(&source, &config);
+                assert_eq!(
+                    string_values(&formatted),
+                    string_values(&source),
+                    "fmt: {}",
+                    path.display()
+                );
+                // `check --fix` and `--unsafe-fix` apply fixes directly.
+                let diagnostics = linter::lint_source(&source, "test.gd", &config);
+                for safe_only in [true, false] {
+                    let fixed = fixer::apply_fixes(&source, &diagnostics, safe_only);
+                    assert_eq!(
+                        string_values(&fixed),
+                        string_values(&source),
+                        "fix (safe_only: {safe_only}): {}",
+                        path.display()
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 10, "only {checked} fixtures found");
 }

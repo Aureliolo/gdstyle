@@ -228,6 +228,51 @@ fn fmt_also_reports_unknown_rule_names() {
 }
 
 #[test]
+fn fmt_check_counts_only_the_files_that_would_change() {
+    let p = project("", "extends Node\n\nvar x := 'a'\n");
+    let formatted = p.script.with_file_name("formatted.gd");
+    std::fs::write(&formatted, "extends Node\n\nvar x := \"a\"\n").expect("write script");
+    let output = Command::new(env!("CARGO_BIN_EXE_gdstyle"))
+        .arg("fmt")
+        .arg("--check")
+        .arg(&p.script)
+        .arg(&formatted)
+        .arg("--config")
+        .arg(&p.config)
+        .arg("--no-color")
+        .output()
+        .expect("run gdstyle");
+
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("1 file would be reformatted."),
+        "two files checked, one needs changes; got stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn fmt_diff_shows_line_ending_changes() {
+    // The file is CRLF except for one LF line, which `fmt` converts. The diff
+    // must show that line as changed rather than print only context lines.
+    let p = project("", "extends Node\r\n\r\nvar x := 1\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_gdstyle"))
+        .arg("fmt")
+        .arg("--diff")
+        .arg(&p.script)
+        .arg("--config")
+        .arg(&p.config)
+        .arg("--no-color")
+        .output()
+        .expect("run gdstyle");
+
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("-var x := 1\n+var x := 1^M\n"),
+        "expected the converted line in the diff; got stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn the_generated_config_names_only_real_rules() {
     // `gdstyle init` writes a template listing every rule. Now that an
     // unrecognised name is reported, the tool's own output must pass its

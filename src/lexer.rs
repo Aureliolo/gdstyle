@@ -558,7 +558,47 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // A letter right after a trailing `.` (`1.abs()`) is invalid in Godot
+        // ("invalid numeric notation"), except an exponent (`1.e5`). Report
+        // the `1.` and leave the name to lex on its own.
+        if is_float && text.ends_with('.') && !self.is_at_end() {
+            let next = self.current_char();
+            let starts_exponent = matches!(next, 'e' | 'E')
+                && match self.peek_char() {
+                    Some('+' | '-') => self.peek_char_at(2).is_some_and(|c| c.is_ascii_digit()),
+                    Some(c) => c.is_ascii_digit(),
+                    None => false,
+                };
+            if (next.is_alphabetic() || next == '_') && !starts_exponent {
+                let span = Span::new(self.line, start_col, start_offset, text.len());
+                return Token::new(
+                    TokenKind::Error(format!(
+                        "invalid number: {} (a name can't follow the decimal point)",
+                        text
+                    )),
+                    span,
+                    text,
+                );
+            }
+        }
+
+        // Godot rejects a second decimal point in a number: any `.` after
+        // a float that has one (`1.5.5`, `.5.5`, even `1.5.abs()`), other
+        // than a `..` range, and `.` plus digits after an exponent (`1e5.5`).
+        let next_is_digit = self.peek_char().is_some_and(|c| c.is_ascii_digit());
+        if is_float
+            && !self.is_at_end()
+            && self.current_char() == '.'
+            && self.peek_char() != Some('.')
+            && (text.contains('.') || next_is_digit)
+        {
+            return self.read_misplaced_decimal_point(start_offset, start_col, text);
+        }
+
         let span = Span::new(self.line, start_col, start_offset, text.len());
+        if let Some(error) = misplaced_underscore_error(&text, span) {
+            return error;
+        }
         let clean = text.replace('_', "");
 
         if is_float {
@@ -588,14 +628,23 @@ impl<'a> Lexer<'a> {
         start_col: usize,
         mut text: String,
     ) -> Token {
+        if !self.is_at_end() && self.current_char() == '_' {
+            return self.read_underscore_after_prefix(start_offset, start_col, text);
+        }
         while !self.is_at_end()
             && (self.current_char().is_ascii_hexdigit() || self.current_char() == '_')
         {
             text.push(self.current_char());
             self.advance();
         }
+        if self.is_at_dot_but_not_range() {
+            return self.read_misplaced_decimal_point(start_offset, start_col, text);
+        }
 
         let span = Span::new(self.line, start_col, start_offset, text.len());
+        if let Some(error) = misplaced_underscore_error(&text, span) {
+            return error;
+        }
         let hex_str = text[2..].replace('_', "");
         match i64::from_str_radix(&hex_str, 16) {
             Ok(val) => Token::new(TokenKind::Integer(val), span, text),
@@ -613,6 +662,9 @@ impl<'a> Lexer<'a> {
         start_col: usize,
         mut text: String,
     ) -> Token {
+        if !self.is_at_end() && self.current_char() == '_' {
+            return self.read_underscore_after_prefix(start_offset, start_col, text);
+        }
         while !self.is_at_end()
             && (self.current_char() == '0'
                 || self.current_char() == '1'
@@ -621,8 +673,14 @@ impl<'a> Lexer<'a> {
             text.push(self.current_char());
             self.advance();
         }
+        if self.is_at_dot_but_not_range() {
+            return self.read_misplaced_decimal_point(start_offset, start_col, text);
+        }
 
         let span = Span::new(self.line, start_col, start_offset, text.len());
+        if let Some(error) = misplaced_underscore_error(&text, span) {
+            return error;
+        }
         let bin_str = text[2..].replace('_', "");
         match i64::from_str_radix(&bin_str, 2) {
             Ok(val) => Token::new(TokenKind::Integer(val), span, text),
@@ -632,6 +690,92 @@ impl<'a> Lexer<'a> {
                 text,
             ),
         }
+    }
+
+    /// Whether the lexer is at a `.` that doesn't start a `..` range. After
+    /// a hex or binary number, Godot rejects any such `.`, method call or not.
+    fn is_at_dot_but_not_range(&self) -> bool {
+        !self.is_at_end() && self.current_char() == '.' && self.peek_char() != Some('.')
+    }
+
+    /// Whether the lexer is at a `.` followed by a digit, which would be a
+    /// decimal point.
+    fn is_at_decimal_point(&self) -> bool {
+        !self.is_at_end()
+            && self.current_char() == '.'
+            && self.peek_char().is_some_and(|c| c.is_ascii_digit())
+    }
+
+    /// Read a misplaced decimal point (the lexer is on it) and the rest of
+    /// the literal, `text` so far included, into one lex error: the `.`, its
+    /// digits, and any further `.digits` groups and exponent. A trailing `.`
+    /// that starts a method call is left for the next token.
+    fn read_misplaced_decimal_point(
+        &mut self,
+        start_offset: usize,
+        start_col: usize,
+        mut text: String,
+    ) -> Token {
+        text.push('.');
+        self.advance();
+        loop {
+            while !self.is_at_end()
+                && (self.current_char().is_ascii_digit() || self.current_char() == '_')
+            {
+                text.push(self.current_char());
+                self.advance();
+            }
+            if self.is_at_decimal_point() {
+                text.push('.');
+                self.advance();
+            } else if !self.is_at_end()
+                && matches!(self.current_char(), 'e' | 'E')
+                && self
+                    .peek_char()
+                    .is_some_and(|c| c.is_ascii_digit() || matches!(c, '+' | '-'))
+            {
+                text.push(self.current_char());
+                self.advance();
+                if matches!(self.current_char(), '+' | '-') {
+                    text.push(self.current_char());
+                    self.advance();
+                }
+            } else {
+                break;
+            }
+        }
+        let span = Span::new(self.line, start_col, start_offset, text.len());
+        Token::new(
+            TokenKind::Error(format!(
+                "invalid number: {} (unexpected '.' inside a number)",
+                text
+            )),
+            span,
+            text,
+        )
+    }
+
+    /// Read a number whose digits start with `_` right after its `0x` / `0b`
+    /// prefix (`0x_FF`), which Godot rejects, into one lex error.
+    fn read_underscore_after_prefix(
+        &mut self,
+        start_offset: usize,
+        start_col: usize,
+        mut text: String,
+    ) -> Token {
+        while !self.is_at_end()
+            && (self.current_char().is_ascii_alphanumeric() || self.current_char() == '_')
+        {
+            text.push(self.current_char());
+            self.advance();
+        }
+        let message = format!(
+            "invalid number: {} (unexpected '_' after '{}')",
+            text,
+            &text[..2]
+        );
+        let span = Span::new(self.line, start_col, start_offset, text.len());
+        Token::new(TokenKind::Error(message), span, text)
     }
 
     fn read_identifier(&mut self) -> Token {
@@ -1008,6 +1152,32 @@ fn is_known_operator_start(ch: char) -> bool {
     )
 }
 
+/// A lex error for a number literal whose `_` digit separators Godot
+/// rejects: two in a row (`1__0`), one right after the decimal point
+/// (`1._5`), or one right after the exponent marker or its sign (`1e_5`).
+/// `None` when the separators are fine.
+fn misplaced_underscore_error(text: &str, span: Span) -> Option<Token> {
+    let chars: Vec<char> = text.chars().collect();
+    let is_misplaced = chars.windows(2).any(|pair| {
+        pair[1] == '_'
+            && (matches!(pair[0], '_' | '.' | '+' | '-') || is_exponent_marker(text, pair[0]))
+    });
+    if !is_misplaced {
+        return None;
+    }
+    Some(Token::new(
+        TokenKind::Error(format!("invalid number: {} (unexpected '_')", text)),
+        span,
+        text.to_string(),
+    ))
+}
+
+/// Whether `c` in the number `text` is an exponent marker: `e` / `E` in a
+/// decimal number. In a hex number they are digits.
+fn is_exponent_marker(text: &str, c: char) -> bool {
+    matches!(c, 'e' | 'E') && !text.starts_with("0x") && !text.starts_with("0X")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1241,68 @@ mod tests {
     fn number_with_underscores() {
         let kinds = token_kinds("1_000_000");
         assert_eq!(kinds, vec![TokenKind::Integer(1_000_000)]);
+    }
+
+    #[test]
+    fn a_second_decimal_point_is_a_lex_error() {
+        // Godot rejects these: a second decimal point (even before a method
+        // name), `.` plus digits after an exponent, and a decimal point in a
+        // hex or binary number.
+        for (source, error_text) in [
+            ("1.5.5", "1.5.5"),
+            (".5.5", ".5.5"),
+            ("1e5.5", "1e5.5"),
+            ("1.0.5.2", "1.0.5.2"),
+            ("1.5.5e3", "1.5.5e3"),
+            ("1.5.abs", "1.5."),
+            ("1.5.5.abs", "1.5.5"),
+            ("0x1F.5", "0x1F.5"),
+            ("0b10.1", "0b10.1"),
+            // Any `.` after a hex or binary number, method call or not.
+            ("0x1F.abs", "0x1F."),
+            ("0b1.", "0b1."),
+            // An underscore right after the prefix, a name right after a
+            // trailing decimal point.
+            ("0x_FF", "0x_FF"),
+            ("0b_1", "0b_1"),
+            ("1.abs", "1."),
+            // Misplaced `_` separators.
+            ("1._5", "1._5"),
+            ("1.__5", "1.__5"),
+            ("1__0", "1__0"),
+            ("1e_5", "1e_5"),
+            ("1e-_5", "1e-_5"),
+            ("0x1__F", "0x1__F"),
+        ] {
+            let tokens = tokenize(source);
+            assert!(
+                matches!(tokens[0].kind, TokenKind::Error(_)) && tokens[0].text == error_text,
+                "{source}: {:?}",
+                tokens[0]
+            );
+        }
+        // A range and an exponent after a trailing dot are fine.
+        assert_eq!(
+            token_kinds("0x1F..5"),
+            vec![
+                TokenKind::Integer(31),
+                TokenKind::DotDot,
+                TokenKind::Integer(5)
+            ]
+        );
+        assert_eq!(token_kinds("1.E+5"), vec![TokenKind::Float(1e5)]);
+        // Separators between digits are fine, and `E` is a hex digit.
+        assert_eq!(token_kinds("1_000.5_5"), vec![TokenKind::Float(1000.55)]);
+        assert_eq!(token_kinds("0xE_5"), vec![TokenKind::Integer(0xE5)]);
+        assert_eq!(
+            token_kinds("1..5"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::DotDot,
+                TokenKind::Integer(5)
+            ]
+        );
+        assert_eq!(token_kinds("1.e5"), vec![TokenKind::Float(1e5)]);
     }
 
     #[test]

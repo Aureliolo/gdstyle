@@ -307,7 +307,7 @@ pub fn all_rules() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "format/number-literals",
-            "Number literals must follow formatting rules",
+            "Hex and binary literals must be lowercase (`0xff`, `0b1`)",
         ),
         (
             "format/one-statement-per-line",

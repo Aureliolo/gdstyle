@@ -138,7 +138,10 @@ pub fn check_trailing_newline(file: &ScriptFile, diagnostics: &mut Vec<Diagnosti
     }
 
     let last_line = &file.lines[file.lines.len() - 1];
-    if !last_line.is_empty() {
+    // A file with no text needs no newline: its whitespace is
+    // format/trailing-whitespace's, which leaves it empty.
+    let has_text = file.lines.iter().any(|line| !line.trim().is_empty());
+    if !last_line.is_empty() && has_text {
         let offset = line_byte_offset(&file.lines, file.lines.len() - 1) + last_line.len();
         diagnostics.push(
             Diagnostic::warning(
@@ -156,7 +159,51 @@ pub fn check_trailing_newline(file: &ScriptFile, diagnostics: &mut Vec<Diagnosti
                 is_safe: true,
             }),
         );
+        return;
     }
+
+    // Blank lines after the last line of code: the file ends with more than
+    // one newline. Delete them, keeping that line's own newline. A file of
+    // only blank lines keeps its first line.
+    let first_extra_idx = file
+        .lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(1, |last_code_idx| last_code_idx + 1);
+    if first_extra_idx + 1 >= file.lines.len() {
+        return;
+    }
+    // When an unterminated string runs to the end of the file, those lines
+    // are its contents. Lexing only here keeps the common case cheap.
+    let source = file.lines.join("\n");
+    let offset = line_byte_offset(&file.lines, first_extra_idx);
+    let ends_inside_a_string = crate::lexer::Lexer::new(&source)
+        .tokenize()
+        .iter()
+        .any(|token| {
+            matches!(&token.kind, TokenKind::Error(message) if message == "unterminated string")
+                && token.span.offset + token.span.length > offset
+        });
+    if ends_inside_a_string {
+        return;
+    }
+    let end = line_byte_offset(&file.lines, file.lines.len() - 1);
+    diagnostics.push(
+        Diagnostic::warning(
+            "format/trailing-newline",
+            "file should end with exactly one newline".to_string(),
+            Span::new(first_extra_idx + 1, 1, offset, 0),
+            &file.path,
+        )
+        .with_fix(Fix {
+            replacements: vec![Replacement {
+                offset,
+                length: end - offset,
+                new_text: String::new(),
+            }],
+            is_safe: true,
+        }),
+    );
 }
 
 /// `indent` (a run of tabs and spaces) as `format/no-tabs-as-spaces` rewrites
@@ -2180,6 +2227,46 @@ mod tests {
         check_trailing_newline(&file, &mut diags);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].fix.is_some());
+    }
+
+    #[test]
+    fn trailing_newline_reports_blank_lines_at_the_end() {
+        // "var x = 5\n\t\n\n": the file ends with more than one newline.
+        let file = make_file(&["var x = 5", "\t", "", ""]);
+        let mut diags = Vec::new();
+        check_trailing_newline(&file, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].span.line, 2);
+        let source = file.lines.join("\n");
+        assert_eq!(apply(&source, &diags), "var x = 5\n");
+    }
+
+    #[test]
+    fn trailing_newline_handles_unterminated_strings_and_blank_files() {
+        // The blank lines of an unterminated string are its contents.
+        let file = make_file(&["var s = \"\"\"abc", "", "", ""]);
+        let mut diags = Vec::new();
+        check_trailing_newline(&file, &mut diags);
+        assert!(diags.is_empty(), "{diags:?}");
+        // A file of only blank lines ends with one newline.
+        let file = make_file(&["", "", "", ""]);
+        let mut diags = Vec::new();
+        check_trailing_newline(&file, &mut diags);
+        assert_eq!(apply(&file.lines.join("\n"), &diags), "\n");
+        // A file of only whitespace needs no newline (trailing-whitespace
+        // empties it, as fmt does).
+        let file = make_file(&["  "]);
+        let mut diags = Vec::new();
+        check_trailing_newline(&file, &mut diags);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn trailing_newline_leaves_blank_lines_inside_a_string() {
+        let file = make_file(&["var s = \"\"\"", "", "", "\"\"\"", ""]);
+        let mut diags = Vec::new();
+        check_trailing_newline(&file, &mut diags);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

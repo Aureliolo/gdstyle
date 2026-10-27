@@ -2,7 +2,7 @@ use crate::ast::ClassMember;
 use crate::diagnostic::{Diagnostic, Replacement};
 use crate::lexer::Lexer;
 use crate::parser::Parser as GdParser;
-use crate::token::{StringLines, Token, TokenKind};
+use crate::token::{Token, TokenKind};
 
 /// Classification of an identifier rename, used to decide which token contexts
 /// it is safe to rewrite.
@@ -198,11 +198,6 @@ pub fn apply_fixes(source: &str, diagnostics: &[Diagnostic], safe_only: bool) ->
     };
 
     crate::linter::restore_line_endings(original_source, &fixed)
-}
-
-fn apply_replacements(source: &str, replacements: Vec<Replacement>) -> String {
-    let result = apply_replacements_no_collapse(source, replacements);
-    collapse_blank_lines(&result)
 }
 
 /// Extract per-file rename records for cross-file reference tracking.
@@ -439,7 +434,7 @@ pub fn apply_cross_file_fixes(source: &str, refs: &[CrossFileReference]) -> Stri
             new_text: r.new_name.clone(),
         })
         .collect();
-    apply_replacements_no_collapse(source, replacements)
+    apply_replacements(source, replacements)
 }
 
 /// A scene-file connection reference that an `--unsafe-fix` rename should
@@ -497,11 +492,13 @@ pub fn apply_scene_renames(
     (out_lines.join("\n"), applied)
 }
 
-/// Same as [`apply_replacements`] but doesn't run the blank-line collapse:
-/// cross-file rewrites don't restructure the file the way same-file fixes
-/// can.
+/// Apply `replacements` to `source`. Blank-line runs are left to the
+/// `format/blank-lines` fix, so turning that rule off or suppressing it
+/// keeps them.
 ///
-/// Two phases:
+/// Phases:
+/// 0. **Moot edits.** Drop edits that lie inside a whitespace-only
+///    deletion: deleting the lines makes them pointless.
 /// 1. **Overlap resolution.** Sort the replacements by length ascending so
 ///    narrower spans win over wider ones (a one-token rename always beats
 ///    a whole-line rewrite that happens to cover the same identifier).
@@ -516,14 +513,43 @@ pub fn apply_scene_renames(
 ///    an operator-spacing insertion adjacent to a string-literal
 ///    replacement comes out as `<insert>` followed by `<replaced text>`,
 ///    never inside it.
-fn apply_replacements_no_collapse(source: &str, replacements: Vec<Replacement>) -> String {
+fn apply_replacements(source: &str, replacements: Vec<Replacement>) -> String {
     if replacements.is_empty() {
         return source.to_string();
     }
 
+    // Phase 0: a replacement that deletes only whitespace, such as the
+    // excess lines of a blank-line run, makes every edit inside it moot
+    // (stripping the tab from one of those lines). Drop such edits, or the
+    // narrower edit would win the overlap below and keep the lines.
+    let whitespace_deletions: Vec<(usize, usize)> = replacements
+        .iter()
+        .filter(|r| r.length > 0 && r.new_text.is_empty())
+        .filter(|r| {
+            source
+                .get(r.offset..r.offset + r.length)
+                .is_some_and(|deleted| deleted.trim().is_empty())
+        })
+        .map(|r| (r.offset, r.offset + r.length))
+        .collect();
+    let is_inside_a_whitespace_deletion = |r: &Replacement| {
+        let r_end = r.offset + r.length;
+        whitespace_deletions.iter().any(|&(start, end)| {
+            if r.length == 0 {
+                // An insertion at either edge lands outside the deleted text.
+                start < r.offset && r.offset < end
+            } else {
+                start <= r.offset && r_end <= end && (r.offset, r_end) != (start, end)
+            }
+        })
+    };
+
     // Phase 1: pick a maximal set of non-overlapping replacements,
     // preferring narrower spans.
-    let mut by_width: Vec<&Replacement> = replacements.iter().collect();
+    let mut by_width: Vec<&Replacement> = replacements
+        .iter()
+        .filter(|r| !is_inside_a_whitespace_deletion(r))
+        .collect();
     by_width.sort_by_key(|r| r.length);
     let mut accepted: Vec<&Replacement> = Vec::with_capacity(by_width.len());
     for r in by_width {
@@ -1006,44 +1032,6 @@ fn find_enum_for_member(members: &[ClassMember], member_old_name: &str) -> Optio
         }
     }
     None
-}
-
-/// Cut runs of 3+ blank lines down to 2. A blank-looking line inside a
-/// multi-line string is string data: it is kept and ends a run.
-fn collapse_blank_lines(source: &str) -> String {
-    // Most fixed sources have no run to collapse; skip lexing for those.
-    let has_long_blank_run = source
-        .split('\n')
-        .scan(0, |run, line| {
-            *run = if line.trim().is_empty() { *run + 1 } else { 0 };
-            Some(*run)
-        })
-        .any(|run| run > 2);
-    if !has_long_blank_run {
-        return source.to_string();
-    }
-    let string_line_mask =
-        StringLines::new(&Lexer::new(source).tokenize(), source.split('\n').count());
-    let mut result = String::with_capacity(source.len());
-    let mut consecutive_empty = 0;
-    for (idx, line) in source.split('\n').enumerate() {
-        if line.trim().is_empty() && !string_line_mask.ends_inside(idx) {
-            consecutive_empty += 1;
-            if consecutive_empty <= 2 {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(line);
-            }
-        } else {
-            consecutive_empty = 0;
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(line);
-        }
-    }
-    result
 }
 
 #[cfg(test)]

@@ -5567,6 +5567,50 @@ func foo(x: int) -> void:
     );
 }
 
+#[test]
+fn quality_no_else_return_nested_return_falls_through() {
+    // The `if a:` branch returns only when `b` holds, so with `a` true and
+    // `b` false it falls through. Dropping the `elif` or `else` would change
+    // the result. A `return` at the branch's own indent after a nested block
+    // still ends it.
+    let config = default_config();
+    let source = "\
+func pick(a: bool, b: bool, c: bool) -> int:
+\tif a:
+\t\tif b:
+\t\t\treturn 1
+\telif c:
+\t\treturn 2
+\treturn 3
+
+
+func other(a: bool, b: bool) -> int:
+\tif a:
+\t\tfor i in 3:
+\t\t\tif b:
+\t\t\t\treturn i
+\telse:
+\t\treturn 2
+\treturn 3
+
+
+func ends(a: bool, b: bool) -> int:
+\tif a:
+\t\tif b:
+\t\t\treturn 1
+\t\treturn 0
+\telse:
+\t\treturn 2
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/no-else-return")
+        .map(|d| d.span.line)
+        .collect();
+    assert_eq!(lines, vec![25]);
+}
+
 // --- unreachable-code ---
 
 #[test]

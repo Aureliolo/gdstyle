@@ -1375,14 +1375,14 @@ fn check_process_get_node_recursive(
         }
         let range = function_body_range(span, *body_line_count, file.lines.len());
         for idx in range {
-            let trimmed = file.lines[idx].trim();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            let has_node_ref = trimmed.contains("get_node(")
-                || trimmed.contains("get_node_or_null(")
-                || trimmed.contains('$')
-                || has_unique_node_ref(trimmed);
+            // Match against a string-blanked copy so a `%d` placeholder or a
+            // `$` inside a string literal isn't read as a node lookup. The
+            // quotes stay, so `%"Health Bar"` is still one.
+            let code = blank_strings_and_comments(&file.lines[idx]);
+            let has_node_ref = code.contains("get_node(")
+                || code.contains("get_node_or_null(")
+                || code.contains('$')
+                || has_unique_node_ref(&code);
             if has_node_ref {
                 diagnostics.push(Diagnostic::warning(
                     "quality/process-get-node",

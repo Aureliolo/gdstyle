@@ -1066,7 +1066,7 @@ pub fn check_no_else_return(file: &ScriptFile, diagnostics: &mut Vec<Diagnostic>
             }
             // Check if this line is at a deeper indent (inside the if block)
             if indent_level(&file.lines[j]) > current_indent {
-                if prev.starts_with("return") {
+                if is_return_statement(prev) && return_ends_branch(file, j, current_indent) {
                     let kind = if trimmed.starts_with("elif") {
                         "elif"
                     } else {
@@ -1085,6 +1085,28 @@ pub fn check_no_else_return(file: &ScriptFile, diagnostics: &mut Vec<Diagnostic>
             }
         }
     }
+}
+
+/// True when the trimmed line is a `return` statement, not an identifier that
+/// starts with `return` (`returned = true`, `return_value.clear()`).
+fn is_return_statement(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("return")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '(']))
+}
+
+/// True when the `return` on line `return_line` is a statement of the branch
+/// body itself, not of a block nested in it. A nested `return`
+/// (`if b: return 1`) can fall through to the `elif` or `else`, so that one
+/// is needed.
+fn return_ends_branch(file: &ScriptFile, return_line: usize, header_indent: usize) -> bool {
+    let return_indent = indent_level(&file.lines[return_line]);
+    file.lines[..return_line]
+        .iter()
+        .rev()
+        .filter(|line| !is_comment_or_blank(line.trim()))
+        .take_while(|line| indent_level(line) > header_indent)
+        .all(|line| indent_level(line) >= return_indent)
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,14 +1397,14 @@ fn check_process_get_node_recursive(
         }
         let range = function_body_range(span, *body_line_count, file.lines.len());
         for idx in range {
-            let trimmed = file.lines[idx].trim();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            let has_node_ref = trimmed.contains("get_node(")
-                || trimmed.contains("get_node_or_null(")
-                || trimmed.contains('$')
-                || has_unique_node_ref(trimmed);
+            // Match against a string-blanked copy so a `%d` placeholder or a
+            // `$` inside a string literal isn't read as a node lookup. The
+            // quotes stay, so `%"Health Bar"` is still one.
+            let code = blank_strings_and_comments(&file.lines[idx]);
+            let has_node_ref = code.contains("get_node(")
+                || code.contains("get_node_or_null(")
+                || code.contains('$')
+                || has_unique_node_ref(&code);
             if has_node_ref {
                 diagnostics.push(Diagnostic::warning(
                     "quality/process-get-node",
@@ -1399,25 +1421,64 @@ fn check_process_get_node_recursive(
 }
 
 /// Check if a line contains a `%UniqueNode` reference, distinguishing it from
-/// the modulo operator.
+/// the modulo and format operator.
 ///
-/// The reliable discriminator is the character *after* `%`: a unique-node
-/// reference is `%` immediately followed by an identifier character or a
-/// quote (`%Player`, `%"Health Bar"`), with no space. The modulo operator
-/// `a % b` always has a space or a digit-with-space around it. Relying on
-/// the character *before* `%` was wrong, `a % b` has a space before `%`
-/// just like ` %Node` does.
+/// A unique-node reference is `%` immediately followed by an identifier
+/// character or a quote (`%Player`, `%"Health Bar"`), with no space. That
+/// alone still reads `"%s"%name` and `a %b` as lookups, so the `%` must also
+/// not follow an operand: like Godot's parser, a `%` after a value is the
+/// binary operator. Expects a line from `blank_strings_and_comments`, so the
+/// quotes before an operator `%` are still there.
 fn has_unique_node_ref(line: &str) -> bool {
     let bytes = line.as_bytes();
     for (i, _) in line.match_indices('%') {
-        match bytes.get(i + 1) {
-            Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'"' || c == b'\'' => {
-                return true;
-            }
-            _ => {}
+        let starts_name = matches!(
+            bytes.get(i + 1),
+            Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'"' || c == b'\''
+        );
+        if starts_name && !follows_operand(&line[..i]) {
+            return true;
         }
     }
     false
+}
+
+/// True when `before` (the code ahead of an operator) ends with a value, so an
+/// operator after it is binary. A closing bracket, a quote, a number or a name
+/// is a value. A keyword like `return` or `and` is not, so `return %Node`
+/// still starts with a lookup.
+fn follows_operand(before: &str) -> bool {
+    let before = before.trim_end();
+    let Some(last) = before.chars().last() else {
+        return false;
+    };
+    if matches!(last, ')' | ']' | '}' | '"' | '\'') {
+        return true;
+    }
+    if !(last.is_alphanumeric() || last == '_') {
+        return false;
+    }
+    let word_start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |index| index + 1);
+    let word = &before[word_start..];
+    !matches!(
+        word,
+        "and"
+            | "or"
+            | "not"
+            | "in"
+            | "is"
+            | "as"
+            | "return"
+            | "await"
+            | "if"
+            | "elif"
+            | "while"
+            | "match"
+            | "when"
+            | "else"
+    )
 }
 
 // ---------------------------------------------------------------------------

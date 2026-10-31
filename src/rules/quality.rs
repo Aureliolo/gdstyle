@@ -1066,7 +1066,7 @@ pub fn check_no_else_return(file: &ScriptFile, diagnostics: &mut Vec<Diagnostic>
             }
             // Check if this line is at a deeper indent (inside the if block)
             if indent_level(&file.lines[j]) > current_indent {
-                if prev.starts_with("return") {
+                if is_return_statement(prev) && return_ends_branch(file, j, current_indent) {
                     let kind = if trimmed.starts_with("elif") {
                         "elif"
                     } else {
@@ -1085,6 +1085,28 @@ pub fn check_no_else_return(file: &ScriptFile, diagnostics: &mut Vec<Diagnostic>
             }
         }
     }
+}
+
+/// True when the trimmed line is a `return` statement, not an identifier that
+/// starts with `return` (`returned = true`, `return_value.clear()`).
+fn is_return_statement(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("return")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '(']))
+}
+
+/// True when the `return` on line `return_line` is a statement of the branch
+/// body itself, not of a block nested in it. A nested `return`
+/// (`if b: return 1`) can fall through to the `elif` or `else`, so that one
+/// is needed.
+fn return_ends_branch(file: &ScriptFile, return_line: usize, header_indent: usize) -> bool {
+    let return_indent = indent_level(&file.lines[return_line]);
+    file.lines[..return_line]
+        .iter()
+        .rev()
+        .filter(|line| !is_comment_or_blank(line.trim()))
+        .take_while(|line| indent_level(line) > header_indent)
+        .all(|line| indent_level(line) >= return_indent)
 }
 
 // ---------------------------------------------------------------------------

@@ -5852,6 +5852,31 @@ func _process(_delta: float) -> void:
     assert_eq!(lines, vec![2, 3]);
 }
 
+#[test]
+fn quality_process_get_node_percent_after_a_value_not_flagged() {
+    // Issue #86: a `%` after a value is the format or modulo operator, even
+    // with no space before the name. After a keyword or an operator it still
+    // starts a lookup.
+    let config = default_config();
+    let source = "\
+func _physics_process(_delta: float) -> void:
+\tprint(\"%s\" % [\"x\"])
+\tprint(\"%s\"%name)
+\tvar wrapped: int = frame_count %limit
+\tvar shown: bool = not %Panel.visible
+\tif visible and %Panel.visible:
+\t\treturn %Label.text.length()
+\tvar nodes: Array = [%Panel, %Label]
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/process-get-node")
+        .map(|d| d.span.line)
+        .collect();
+    assert_eq!(lines, vec![5, 6, 7, 8]);
+}
+
 // --- unnecessary-pass ---
 
 #[test]

@@ -5611,6 +5611,67 @@ func ends(a: bool, b: bool) -> int:
     assert_eq!(lines, vec![25]);
 }
 
+#[test]
+fn quality_no_else_return_return_in_nested_else_not_flagged() {
+    // Issue #87: the outer branch returns only from its inner `else`, so it
+    // falls through when `is_turtle` holds and the outer `else` is needed.
+    let config = default_config();
+    let source = "\
+func too_fast(is_turtle: bool) -> void:
+\tif Engine.get_frames_per_second() <= 60:
+\t\tif is_turtle:
+\t\t\tprint(\"Turtles like slow\")
+\t\telse:
+\t\t\treturn
+\telse:
+\t\tprint(\"Make turtle soup\")
+\tprint(\"after\")
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/no-else-return")
+        .map(|d| d.span.line)
+        .collect();
+    assert!(lines.is_empty(), "flagged lines {lines:?}");
+}
+
+#[test]
+fn quality_no_else_return_identifier_starting_with_return_not_flagged() {
+    // `returned = true` is an assignment, not a `return`, so the branch falls
+    // through. A bare `return` and `return(x)` still end it.
+    let config = default_config();
+    let source = "\
+func f(a: bool) -> void:
+\tvar returned: bool = false
+\tif a:
+\t\treturned = true
+\telse:
+\t\tprint(returned)
+
+
+func g(a: bool) -> void:
+\tif a:
+\t\treturn
+\telse:
+\t\tprint(a)
+
+
+func h(a: bool) -> int:
+\tif a:
+\t\treturn(1)
+\telse:
+\t\treturn 2
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/no-else-return")
+        .map(|d| d.span.line)
+        .collect();
+    assert_eq!(lines, vec![12, 19]);
+}
+
 // --- unreachable-code ---
 
 #[test]

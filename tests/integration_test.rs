@@ -5917,6 +5917,71 @@ func _process(_delta: float) -> void:
     );
 }
 
+#[test]
+fn quality_process_get_node_inside_strings_and_comments_not_flagged() {
+    // A `%d` placeholder, a `$` or `get_node(` inside a string, and a lookup
+    // named in a trailing comment are not node lookups.
+    let config = default_config();
+    let source = "\
+func _process(_delta: float) -> void:
+\tvar line: String = \"a %d b\" % 3
+\tvar price: String = \"$5\"
+\tprint(line, price, \"call get_node(\\\"x\\\") later\")  # not $Node or %Node
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/process-get-node")
+        .map(|d| d.span.line)
+        .collect();
+    assert!(lines.is_empty(), "flagged lines {lines:?}");
+}
+
+#[test]
+fn quality_process_get_node_quoted_unique_node_flagged() {
+    // Blanking strings keeps the quotes, so `%"Name"` and `$"Path"` are still
+    // lookups.
+    let config = default_config();
+    let source = "\
+func _process(_delta: float) -> void:
+\tvar bar = %\"Health Bar\"
+\tvar label = $\"HUD/Label\"
+\tbar.value += label.text.length()
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/process-get-node")
+        .map(|d| d.span.line)
+        .collect();
+    assert_eq!(lines, vec![2, 3]);
+}
+
+#[test]
+fn quality_process_get_node_percent_after_a_value_not_flagged() {
+    // Issue #86: a `%` after a value is the format or modulo operator, even
+    // with no space before the name. After a keyword or an operator it still
+    // starts a lookup.
+    let config = default_config();
+    let source = "\
+func _physics_process(_delta: float) -> void:
+\tprint(\"%s\" % [\"x\"])
+\tprint(\"%s\"%name)
+\tvar wrapped: int = frame_count %limit
+\tvar shown: bool = not %Panel.visible
+\tif visible and %Panel.visible:
+\t\treturn %Label.text.length()
+\tvar nodes: Array = [%Panel, %Label]
+";
+    let diagnostics = linter::lint_source(source, "test.gd", &config);
+    let lines: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.rule == "quality/process-get-node")
+        .map(|d| d.span.line)
+        .collect();
+    assert_eq!(lines, vec![5, 6, 7, 8]);
+}
+
 // --- unnecessary-pass ---
 
 #[test]
